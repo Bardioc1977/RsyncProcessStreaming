@@ -25,23 +25,35 @@ actor StreamAccumulator {
 
     /// Consumes text data and returns any complete lines.
     ///
-    /// Partial lines (text without a trailing newline) are buffered internally
+    /// Lines are delimited by `\n`, `\r\n`, or standalone `\r`.
+    /// Standalone `\r` is treated as a line break to support rsync `--progress`
+    /// output, which uses carriage return to overwrite the current line.
+    /// Partial lines (text without a trailing delimiter) are buffered internally
     /// and combined with the next chunk of data. Empty lines are filtered out.
     ///
     /// - Parameter text: Raw text data from stdout
     /// - Returns: Array of complete, non-empty lines extracted from the text
     func consume(_ text: String) -> [String] {
-        var lines: [String] = []
+        var newLines: [String] = []
         var buffer = partialLine
 
         for char in text {
             if char == "\n" {
-                // Handle \r\n or just \n
+                // \r\n case: strip trailing \r
                 if buffer.hasSuffix("\r") {
                     buffer.removeLast()
                 }
                 if !buffer.isEmpty {
-                    lines.append(buffer)
+                    newLines.append(buffer)
+                }
+                buffer = ""
+            } else if char == "\r" {
+                // Standalone \r: treat as line break (rsync --progress output).
+                // If a \n follows immediately, the \n branch above handles the \r\n pair
+                // because the \r will have been appended to buffer and stripped there.
+                // But for standalone \r (no following \n), we emit the line now.
+                if !buffer.isEmpty {
+                    newLines.append(buffer)
                 }
                 buffer = ""
             } else {
@@ -50,8 +62,8 @@ actor StreamAccumulator {
         }
 
         partialLine = buffer
-        self.lines.append(contentsOf: lines)
-        return lines
+        lines.append(contentsOf: newLines)
+        return newLines
     }
 
     /// Flushes any remaining partial line as a complete line.

@@ -78,6 +78,7 @@ public final class RsyncProcess {
     private let hiddenID: Int?
     private let handlers: ProcessHandlers
     private let useFileHandler: Bool
+    private let usePty: Bool
     private let timeoutInterval: TimeInterval?
     private var accumulator = StreamAccumulator()
 
@@ -88,6 +89,10 @@ public final class RsyncProcess {
     private var cancelled = false
     private var errorOccurred = false
 
+    // pty file descriptors (only used when usePty is true)
+    private var ptyPrimary: Int32 = -1
+    private var ptyReadSource: DispatchSourceRead?
+
     /// Creates a new RsyncProcess instance.
     ///
     /// - Parameters:
@@ -96,12 +101,16 @@ public final class RsyncProcess {
     ///   - handlers: Configuration for all process callbacks and behaviors
     ///   - useFileHandler: Whether to invoke fileHandler callback for each line (default: false)
     ///   - timeout: Optional timeout interval in seconds after which the process will be terminated
+    ///   - usePty: Use a pseudo-terminal for stdout instead of a pipe. Forces rsync
+    ///     into line-buffered mode so that `--progress` output arrives in real time
+    ///     instead of being held in stdio buffers. Default: false.
     public init(
         arguments: [String],
         hiddenID: Int? = nil,
         handlers: ProcessHandlers,
         useFileHandler: Bool = false,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        usePty: Bool = false
     ) {
         // Validate arguments
         precondition(!arguments.isEmpty, "Arguments cannot be empty")
@@ -113,9 +122,10 @@ public final class RsyncProcess {
         self.hiddenID = hiddenID
         self.handlers = handlers
         self.useFileHandler = useFileHandler
+        self.usePty = usePty
         timeoutInterval = timeout
 
-        Logger.process.debugMessage("RsyncProcessStreaming initialized with \(arguments.count) arguments")
+        Logger.process.debugMessage("RsyncProcessStreaming initialized with \(arguments.count) arguments, usePty=\(usePty)")
     }
 
     /// Executes the rsync process with configured arguments and streams output.
@@ -142,16 +152,26 @@ public final class RsyncProcess {
         process.arguments = arguments
         process.environment = handlers.environment
 
-        let outputPipe = Pipe()
         let errorPipe = Pipe()
-        process.standardOutput = outputPipe
         process.standardError = errorPipe
+
+        if usePty {
+            try setupPtyOutput(process: process)
+        } else {
+            let outputPipe = Pipe()
+            process.standardOutput = outputPipe
+            setupPipeHandlers(outputPipe: outputPipe, errorPipe: errorPipe)
+            setupTerminationHandler(process: process, outputPipe: outputPipe, errorPipe: errorPipe)
+        }
+
+        if usePty {
+            setupPtyErrorHandler(errorPipe: errorPipe)
+            setupPtyTerminationHandler(process: process, errorPipe: errorPipe)
+        }
 
         currentProcess = process
         handlers.updateProcess(process)
 
-        setupPipeHandlers(outputPipe: outputPipe, errorPipe: errorPipe)
-        setupTerminationHandler(process: process, outputPipe: outputPipe, errorPipe: errorPipe)
         startTimeoutTimer()
 
         try process.run()
@@ -387,9 +407,135 @@ public final class RsyncProcess {
         handlers.updateProcess(nil)
     }
 
+    // MARK: - PTY Support
+
+    /// Allocates a pseudo-terminal and assigns the replica side to the process's stdout.
+    ///
+    /// Uses `cfmakeraw()` for unmodified byte pass-through (no ONLCR, no ICANON).
+    /// The primary side is read via DispatchSource on the **main queue** so that
+    /// event handler and termination drain never race on the same fd.
+    private func setupPtyOutput(process: Process) throws {
+        var primary: Int32 = 0
+        var replica: Int32 = 0
+
+        guard openpty(&primary, &replica, nil, nil, nil) == 0 else {
+            throw RsyncProcessError.executableNotFound("Failed to allocate pty")
+        }
+
+        self.ptyPrimary = primary
+
+        // Raw mode: no echo, no ONLCR, no ICANON — bytes pass through unmodified.
+        var raw = Darwin.termios()
+        tcgetattr(primary, &raw)
+        cfmakeraw(&raw)
+        tcsetattr(primary, TCSANOW, &raw)
+
+        // Non-blocking so reads on the main queue never stall the RunLoop.
+        let flags = fcntl(primary, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(primary, F_SETFL, flags | O_NONBLOCK)
+        }
+
+        // Assign replica (child side) to process stdout.
+        process.standardOutput = FileHandle(fileDescriptor: replica, closeOnDealloc: true)
+
+        // DispatchSource on .main — event handler runs on the main thread.
+        let source = DispatchSource.makeReadSource(fileDescriptor: primary, queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self, !self.cancelled, !self.errorOccurred else { return }
+
+            let bufferSize = 16384
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+            defer { buffer.deallocate() }
+
+            // Read all available data in a loop (non-blocking fd).
+            var chunk = Data()
+            while true {
+                let n = read(primary, buffer, bufferSize)
+                if n <= 0 { break }
+                chunk.append(buffer, count: n)
+            }
+            guard !chunk.isEmpty else { return }
+
+            if let text = String(data: chunk, encoding: .utf8), !text.isEmpty {
+                Task { @MainActor in
+                    await self.handleOutputData(text)
+                }
+            }
+        }
+        // Cancel handler does NOT close the fd — termination handler closes after drain.
+        source.resume()
+        self.ptyReadSource = source
+    }
+
+    private func setupPtyErrorHandler(errorPipe: Pipe) {
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+
+            Task { @MainActor in
+                guard let self else { return }
+                if let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                    await self.accumulator.recordError(text)
+                }
+            }
+        }
+    }
+
+    /// Termination handler for pty mode.
+    ///
+    /// Cancels the DispatchSource, then performs drain + final processing on `.main`
+    /// to avoid racing with the source's event handler on the same fd.
+    private func setupPtyTerminationHandler(process: Process, errorPipe: Pipe) {
+        let primaryFD = self.ptyPrimary
+        let readSource = self.ptyReadSource
+
+        process.terminationHandler = { [weak self] task in
+            // 1. Cancel the source — no more event handler invocations.
+            readSource?.cancel()
+
+            // 2. Drain error pipe on a background thread (separate fd, no race).
+            let errorData = Self.drainPipe(errorPipe.fileHandleForReading)
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+
+            // 3. After a short delay, drain + process on .main.
+            //    This ensures any in-flight DispatchSource Tasks have run first.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                // Drain remaining pty data (fd is non-blocking, still open).
+                let bufferSize = 65536
+                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+                defer { buffer.deallocate() }
+                var drainedData = Data()
+                while true {
+                    let n = read(primaryFD, buffer, bufferSize)
+                    if n <= 0 { break }
+                    drainedData.append(buffer, count: n)
+                }
+
+                // Now close the fd.
+                close(primaryFD)
+
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.ptyReadSource = nil
+                    await self.processFinalOutput(
+                        finalOutputData: drainedData,
+                        finalErrorData: errorData,
+                        task: task
+                    )
+                }
+            }
+        }
+    }
+
     private func cleanupProcess() {
         timeoutTimer?.invalidate()
         timeoutTimer = nil
+        if let source = ptyReadSource {
+            source.cancel()
+            close(ptyPrimary)
+            ptyReadSource = nil
+        }
         currentProcess = nil
         state = .idle
     }
